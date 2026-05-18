@@ -99,6 +99,263 @@ static int socketd_discard_payload(int fd, uint32_t len) {
   return 0;
 }
 
+static int socketd_read_payload(int fd, void *buf, uint32_t expected_len,
+                                uint32_t actual_len) {
+  if (actual_len != expected_len)
+    return -1;
+  return socketd_read_exact(fd, buf, expected_len);
+}
+
+/*
+ * Wire-format 64-bit host -> network conversion.
+ *
+ * CONCERN(socketd-wire):
+ * The private protocol now carries several int64_t timestamp fields. Keep
+ * conversion explicit here rather than relying on a non-standard htonll().
+ */
+static uint64_t socketd_hton64(uint64_t value) {
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+  return value;
+#else
+  return ((uint64_t)htonl((uint32_t)(value & 0xffffffffULL)) << 32) |
+         (uint64_t)htonl((uint32_t)(value >> 32));
+#endif
+}
+
+static int socketd_read_proc_start_ticks(pid_t pid,
+                                         unsigned long long *ticks_out) {
+  if (pid <= 0 || ticks_out == NULL)
+    return -1;
+
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+
+  FILE *f = fopen(path, "re");
+  if (!f)
+    return -1;
+
+  char stat_buf[4096];
+  size_t n = fread(stat_buf, 1, sizeof(stat_buf) - 1, f);
+  int read_failed = ferror(f);
+  fclose(f);
+
+  if (read_failed || n == 0)
+    return -1;
+
+  stat_buf[n] = '\0';
+
+  char *rparen = strrchr(stat_buf, ')');
+  if (!rparen || rparen[1] != ' ')
+    return -1;
+
+  /*
+   * /proc/<pid>/stat field 2 is the parenthesized command name and may
+   * contain spaces. Start tokenizing only after the final ')' so that field
+   * numbering remains aligned with procfs; starttime is field 22.
+   */
+  char *cursor = rparen + 2;
+  char *saveptr = NULL;
+  int field_no = 3;
+
+  for (char *tok = strtok_r(cursor, " \t\r\n", &saveptr);
+       tok != NULL;
+       tok = strtok_r(NULL, " \t\r\n", &saveptr), field_no++) {
+    if (field_no == 22) {
+      char *end = NULL;
+      errno = 0;
+      unsigned long long ticks = strtoull(tok, &end, 10);
+      if (errno != 0 || end == tok || *end != '\0')
+        return -1;
+
+      *ticks_out = ticks;
+      return 0;
+    }
+  }
+
+  return -1;
+}
+
+static int socketd_read_uptime_seconds(double *uptime_out) {
+  if (!uptime_out)
+    return -1;
+
+  FILE *f = fopen("/proc/uptime", "re");
+  if (!f)
+    return -1;
+
+  double uptime = 0.0;
+  int scanned = fscanf(f, "%lf", &uptime);
+  fclose(f);
+
+  if (scanned != 1 || uptime < 0.0)
+    return -1;
+
+  *uptime_out = uptime;
+  return 0;
+}
+
+static int64_t socketd_container_started_at_epoch(pid_t pid) {
+  unsigned long long start_ticks = 0;
+  double uptime_seconds = 0.0;
+
+  if (socketd_read_proc_start_ticks(pid, &start_ticks) < 0)
+    return 0;
+
+  if (socketd_read_uptime_seconds(&uptime_seconds) < 0)
+    return 0;
+
+  long ticks_per_second = sysconf(_SC_CLK_TCK);
+  if (ticks_per_second <= 0)
+    return 0;
+
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) < 0)
+    return 0;
+
+  double started_since_boot =
+      (double)start_ticks / (double)ticks_per_second;
+  double boot_epoch = (double)now.tv_sec - uptime_seconds;
+  double started_epoch = boot_epoch + started_since_boot;
+
+  if (started_epoch <= 0.0 || started_epoch > (double)INT64_MAX)
+    return 0;
+
+  return (int64_t)started_epoch;
+}
+
+static int socketd_pidfile_to_container_name(const char *filename,
+                                              char *name_out,
+                                              size_t name_size) {
+  if (!filename || !name_out || name_size == 0)
+    return -1;
+
+  size_t filename_len = strlen(filename);
+  size_t suffix_len = strlen(DS_EXT_PID);
+
+  if (filename_len <= suffix_len)
+    return -1;
+
+  if (strcmp(filename + filename_len - suffix_len, DS_EXT_PID) != 0)
+    return -1;
+
+  size_t name_len = filename_len - suffix_len;
+  if (name_len >= name_size)
+    return -1;
+
+  memcpy(name_out, filename, name_len);
+  name_out[name_len] = '\0';
+
+  return validate_container_name(name_out) ? 0 : -1;
+}
+
+static void socketd_free_loaded_config(struct ds_config *cfg) {
+  free_config_binds(cfg);
+  free_config_env_vars(cfg);
+  free_config_unknown_lines(cfg);
+}
+
+static void socketd_pack_container_record(
+    struct ds_socketd_container_record *record,
+    const struct ds_config *cfg,
+    pid_t pid) {
+  memset(record, 0, sizeof(*record));
+
+  safe_strncpy(record->name, cfg->container_name, sizeof(record->name));
+
+  /*
+   * CONCERN(socketd-identity):
+   * This private wire record follows the current plan and forwards the
+   * Droidspaces config UUID verbatim. Any public Docker-compatible identity
+   * policy remains the responsibility of the C++ JSON seam.
+   */
+  safe_strncpy(record->uuid, cfg->uuid, sizeof(record->uuid));
+
+  /*
+   * CONCERN(socketd-container-list):
+   * Phase 2.3 follows the implementation plan literally and exports
+   * cfg->rootfs_path here. Any later distinction between mounted rootfs paths
+   * and rootfs image source paths must be settled deliberately at the
+   * compatibility boundary.
+   */
+  safe_strncpy(record->rootfs_path, cfg->rootfs_path,
+               sizeof(record->rootfs_path));
+
+  safe_strncpy(record->hostname, cfg->hostname, sizeof(record->hostname));
+
+  if (cfg->net_mode == DS_NET_NAT) {
+    const char *nat_ip =
+        cfg->static_nat_ip[0] ? cfg->static_nat_ip : cfg->nat_container_ip;
+    safe_strncpy(record->nat_ip, nat_ip, sizeof(record->nat_ip));
+  }
+
+  safe_strncpy(record->custom_init, cfg->custom_init,
+               sizeof(record->custom_init));
+
+  record->pid_be = (int32_t)htonl((uint32_t)(pid > 0 ? pid : 0));
+  record->net_mode = (uint8_t)cfg->net_mode;
+
+  int port_count = cfg->port_forward_count;
+  if (port_count < 0)
+    port_count = 0;
+  if (port_count > DS_SOCKETD_RECORD_PORTS_MAX)
+    port_count = DS_SOCKETD_RECORD_PORTS_MAX;
+
+  record->port_count = (uint8_t)port_count;
+
+  for (int i = 0; i < port_count; i++) {
+    const struct ds_port_forward *src = &cfg->port_forwards[i];
+    struct ds_socketd_port_record *dst = &record->ports[i];
+
+    dst->host_port_be = htons(src->host_port);
+    dst->host_port_end_be = htons(src->host_port_end);
+    dst->container_port_be = htons(src->container_port);
+    dst->container_port_end_be = htons(src->container_port_end);
+    dst->proto = (strcmp(src->proto, "udp") == 0) ? 1u : 0u;
+  }
+
+  int64_t started_at = pid > 0 ? socketd_container_started_at_epoch(pid) : 0;
+  record->started_at_be =
+      (int64_t)socketd_hton64((uint64_t)started_at);
+}
+
+static int socketd_append_container_record(
+    struct ds_socketd_container_record **records_inout,
+    size_t *count_inout,
+    size_t *capacity_inout,
+    const struct ds_socketd_container_record *record) {
+  if (!records_inout || !count_inout || !capacity_inout || !record)
+    return -1;
+
+  if (*count_inout >= *capacity_inout) {
+    size_t old_capacity = *capacity_inout;
+    size_t new_capacity = old_capacity == 0 ? 16u : old_capacity * 2u;
+
+    if (new_capacity < old_capacity)
+      return -1;
+
+    if (new_capacity >
+        DS_SOCKETD_MAX_PAYLOAD /
+            sizeof(struct ds_socketd_container_record)) {
+      return -1;
+    }
+
+    struct ds_socketd_container_record *grown =
+        realloc(*records_inout, new_capacity * sizeof(*grown));
+    if (!grown)
+      return -1;
+
+    memset(grown + old_capacity, 0,
+           (new_capacity - old_capacity) * sizeof(*grown));
+
+    *records_inout = grown;
+    *capacity_inout = new_capacity;
+  }
+
+  (*records_inout)[*count_inout] = *record;
+  (*count_inout)++;
+  return 0;
+}
+
 static void socketd_handle_conn(int conn) {
   struct ds_socketd_request_header req;
   memset(&req, 0, sizeof(req));
@@ -132,13 +389,21 @@ static void socketd_handle_conn(int conn) {
    * The currently implemented opcodes do not consume payloads, but draining
    * a well-sized payload keeps the framing strict and future-proofs callers.
    */
+#if 0
   if (payload_len > 0 && socketd_discard_payload(conn, payload_len) < 0) {
     socketd_send_response(conn, DS_SOCKETD_STATUS_BAD_REQUEST, NULL, 0);
     return;
   }
+#endif //deprecated
 
   switch ((enum ds_socketd_opcode)opcode) {
   case DS_SOCKETD_OP_PING: {
+    if (payload_len > 0 &&
+        socketd_discard_payload(conn, payload_len) < 0) {
+      socketd_send_response(conn, DS_SOCKETD_STATUS_BAD_REQUEST, NULL, 0);
+      return;
+    }
+
     static const char pong[] = "PONG";
     socketd_send_response(conn, DS_SOCKETD_STATUS_OK, pong,
                           (uint32_t)(sizeof(pong) - 1));
@@ -146,16 +411,185 @@ static void socketd_handle_conn(int conn) {
   }
 
   case DS_SOCKETD_OP_CAPABILITIES: {
+    if (payload_len > 0 &&
+        socketd_discard_payload(conn, payload_len) < 0) {
+      socketd_send_response(conn, DS_SOCKETD_STATUS_BAD_REQUEST, NULL, 0);
+      return;
+    }
+
     uint32_t caps_be = htonl(DS_SOCKETD_CAP_PROTOCOL_V1 |
                              DS_SOCKETD_CAP_PING |
-                             DS_SOCKETD_CAP_CAPABILITIES);
+                             DS_SOCKETD_CAP_CAPABILITIES |
+                             DS_SOCKETD_CAP_LIST_CONTAINERS);
     socketd_send_response(conn, DS_SOCKETD_STATUS_OK, &caps_be,
                           (uint32_t)sizeof(caps_be));
     return;
   }
 
+  case DS_SOCKETD_OP_LIST_CONTAINERS: {
+    struct ds_socketd_list_containers_req list_req;
+    memset(&list_req, 0, sizeof(list_req));
+
+    /*
+     * A zero-length payload is accepted as the historical default:
+     * running containers only.
+     */
+    if (payload_len != 0 &&
+        socketd_read_payload(conn, &list_req,
+                             (uint32_t)sizeof(list_req),
+                             payload_len) < 0) {
+      socketd_send_response(conn, DS_SOCKETD_STATUS_BAD_REQUEST, NULL, 0);
+      return;
+    }
+
+    int running_hint = count_running_containers(NULL, 0);
+
+    size_t capacity = 16;
+    if (running_hint > 16)
+      capacity = (size_t)running_hint;
+
+    if (capacity >
+        DS_SOCKETD_MAX_PAYLOAD /
+            sizeof(struct ds_socketd_container_record)) {
+      socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR, NULL, 0);
+      return;
+    }
+
+    struct ds_socketd_container_record *records =
+        calloc(capacity, sizeof(*records));
+    if (!records) {
+      socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR, NULL, 0);
+      return;
+    }
+
+    size_t record_count = 0;
+
+    /*
+     * Pass 1: running containers from the Pids/ directory.
+     *
+     * This mirrors the runtime's own status/reporting scans and keeps the
+     * bridge anchored to the existing PID-sidecar authority.
+     */
+    DIR *pids_dir = opendir(get_pids_dir());
+    if (pids_dir) {
+      struct dirent *ent;
+
+      while ((ent = readdir(pids_dir)) != NULL) {
+        char name[256];
+        if (socketd_pidfile_to_container_name(ent->d_name, name,
+                                              sizeof(name)) < 0) {
+          continue;
+        }
+
+        struct ds_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+
+        if (ds_config_load_by_name(name, &cfg) < 0 ||
+            !cfg.config_file_existed) {
+          socketd_free_loaded_config(&cfg);
+          continue;
+        }
+
+        pid_t pid = 0;
+        if (!is_container_running(&cfg, &pid) || pid <= 0) {
+          socketd_free_loaded_config(&cfg);
+          continue;
+        }
+
+        struct ds_socketd_container_record record;
+        socketd_pack_container_record(&record, &cfg, pid);
+
+        if (socketd_append_container_record(&records, &record_count,
+                                            &capacity, &record) < 0) {
+          socketd_free_loaded_config(&cfg);
+          closedir(pids_dir);
+          free(records);
+          socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR,
+                                NULL, 0);
+          return;
+        }
+
+        socketd_free_loaded_config(&cfg);
+      }
+
+      closedir(pids_dir);
+    } else if (errno != ENOENT) {
+      free(records);
+      socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR, NULL, 0);
+      return;
+    }
+
+    /*
+     * Pass 2: when include_all is set, append stopped installed containers
+     * from Containers/. Running ones are skipped because they were already
+     * emitted by the PID-sidecar pass above.
+     */
+    if (list_req.include_all) {
+      char containers_path[PATH_MAX];
+      snprintf(containers_path, sizeof(containers_path), "%s/Containers",
+               get_workspace_dir());
+
+      DIR *containers_dir = opendir(containers_path);
+      if (containers_dir) {
+        struct dirent *ent;
+
+        while ((ent = readdir(containers_dir)) != NULL) {
+          if (ent->d_name[0] == '.')
+            continue;
+
+          if (!validate_container_name(ent->d_name))
+            continue;
+
+          struct ds_config cfg;
+          memset(&cfg, 0, sizeof(cfg));
+
+          if (ds_config_load_by_name(ent->d_name, &cfg) < 0 ||
+              !cfg.config_file_existed) {
+            socketd_free_loaded_config(&cfg);
+            continue;
+          }
+
+          pid_t pid = 0;
+          if (is_container_running(&cfg, &pid) && pid > 0) {
+            socketd_free_loaded_config(&cfg);
+            continue;
+          }
+
+          struct ds_socketd_container_record record;
+          socketd_pack_container_record(&record, &cfg, 0);
+
+          if (socketd_append_container_record(&records, &record_count,
+                                              &capacity, &record) < 0) {
+            socketd_free_loaded_config(&cfg);
+            closedir(containers_dir);
+            free(records);
+            socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR,
+                                  NULL, 0);
+            return;
+          }
+
+          socketd_free_loaded_config(&cfg);
+        }
+
+        closedir(containers_dir);
+      } else if (errno != ENOENT) {
+        free(records);
+        socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR,
+                              NULL, 0);
+        return;
+      }
+    }
+
+    uint32_t payload_bytes =
+        (uint32_t)(record_count * sizeof(*records));
+
+    socketd_send_response(conn, DS_SOCKETD_STATUS_OK, records,
+                          payload_bytes);
+    free(records);
+    return;
+  }
+
   case DS_SOCKETD_OP_INFO:
-  case DS_SOCKETD_OP_LIST_CONTAINERS:
   case DS_SOCKETD_OP_INSPECT_CONTAINER:
   case DS_SOCKETD_OP_START_CONTAINER:
   case DS_SOCKETD_OP_STOP_CONTAINER:
