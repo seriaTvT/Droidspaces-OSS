@@ -356,6 +356,77 @@ static int socketd_append_container_record(
   return 0;
 }
 
+static void socketd_pack_image_record(
+    struct ds_socketd_image_record *record,
+    const struct ds_config *cfg,
+    int is_running) {
+  memset(record, 0, sizeof(*record));
+
+  safe_strncpy(record->name, cfg->container_name, sizeof(record->name));
+
+  /*
+   * The plan defines pseudo-images as the rootfs object associated with each
+   * installed container config. For image-backed containers, preserve the
+   * underlying image-file path; otherwise expose the configured rootfs path.
+   */
+  if (cfg->rootfs_img_path[0]) {
+    safe_strncpy(record->rootfs_path, cfg->rootfs_img_path,
+                 sizeof(record->rootfs_path));
+  } else {
+    safe_strncpy(record->rootfs_path, cfg->rootfs_path,
+                 sizeof(record->rootfs_path));
+  }
+
+  safe_strncpy(record->uuid, cfg->uuid, sizeof(record->uuid));
+
+  record->is_running_be = (int32_t)htonl(is_running ? 1u : 0u);
+
+  /*
+   * Droidspaces container configs do not currently persist an explicit
+   * creation timestamp. The wire contract reserves this field for later
+   * enrichment; Phase 2.5 intentionally reports "unknown" as zero.
+   */
+  record->created_at_be = (int64_t)socketd_hton64(0);
+}
+
+static int socketd_append_image_record(
+    struct ds_socketd_image_record **records_inout,
+    size_t *count_inout,
+    size_t *capacity_inout,
+    const struct ds_socketd_image_record *record) {
+  if (!records_inout || !count_inout || !capacity_inout || !record)
+    return -1;
+
+  if (*count_inout >= *capacity_inout) {
+    size_t old_capacity = *capacity_inout;
+    size_t new_capacity = old_capacity == 0 ? 16u : old_capacity * 2u;
+
+    if (new_capacity < old_capacity)
+      return -1;
+
+    if (new_capacity >
+        DS_SOCKETD_MAX_PAYLOAD /
+            sizeof(struct ds_socketd_image_record)) {
+      return -1;
+    }
+
+    struct ds_socketd_image_record *grown =
+        realloc(*records_inout, new_capacity * sizeof(*grown));
+    if (!grown)
+      return -1;
+
+    memset(grown + old_capacity, 0,
+           (new_capacity - old_capacity) * sizeof(*grown));
+
+    *records_inout = grown;
+    *capacity_inout = new_capacity;
+  }
+
+  (*records_inout)[*count_inout] = *record;
+  (*count_inout)++;
+  return 0;
+}
+
 static int socketd_count_installed_containers(uint32_t *count_out) {
   if (!count_out)
     return -1;
@@ -472,7 +543,8 @@ static void socketd_handle_conn(int conn) {
                              DS_SOCKETD_CAP_PING |
                              DS_SOCKETD_CAP_CAPABILITIES |
                              DS_SOCKETD_CAP_INFO |
-                             DS_SOCKETD_CAP_LIST_CONTAINERS);
+                             DS_SOCKETD_CAP_LIST_CONTAINERS |
+                             DS_SOCKETD_CAP_LIST_IMAGES);
     socketd_send_response(conn, DS_SOCKETD_STATUS_OK, &caps_be,
                           (uint32_t)sizeof(caps_be));
     return;
@@ -671,6 +743,88 @@ static void socketd_handle_conn(int conn) {
                               NULL, 0);
         return;
       }
+    }
+
+    uint32_t payload_bytes =
+        (uint32_t)(record_count * sizeof(*records));
+
+    socketd_send_response(conn, DS_SOCKETD_STATUS_OK, records,
+                          payload_bytes);
+    free(records);
+    return;
+  }
+  
+    case DS_SOCKETD_OP_LIST_IMAGES: {
+    if (payload_len > 0 &&
+        socketd_discard_payload(conn, payload_len) < 0) {
+      socketd_send_response(conn, DS_SOCKETD_STATUS_BAD_REQUEST, NULL, 0);
+      return;
+    }
+
+    size_t capacity = 16;
+    struct ds_socketd_image_record *records =
+        calloc(capacity, sizeof(*records));
+    if (!records) {
+      socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR, NULL, 0);
+      return;
+    }
+
+    size_t record_count = 0;
+
+    char containers_path[PATH_MAX];
+    snprintf(containers_path, sizeof(containers_path), "%s/Containers",
+             get_workspace_dir());
+
+    DIR *containers_dir = opendir(containers_path);
+    if (containers_dir) {
+      struct dirent *ent;
+
+      /*
+       * One pseudo-image record is emitted for each installed container config,
+       * as defined by the implementation plan. The bridge does not attempt to
+       * deduplicate configs that happen to reference the same rootfs object.
+       */
+      while ((ent = readdir(containers_dir)) != NULL) {
+        if (ent->d_name[0] == '.')
+          continue;
+
+        if (!validate_container_name(ent->d_name))
+          continue;
+
+        struct ds_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+
+        if (ds_config_load_by_name(ent->d_name, &cfg) < 0 ||
+            !cfg.config_file_existed) {
+          socketd_free_loaded_config(&cfg);
+          continue;
+        }
+
+        pid_t pid = 0;
+        int is_running =
+            is_container_running(&cfg, &pid) && pid > 0;
+
+        struct ds_socketd_image_record record;
+        socketd_pack_image_record(&record, &cfg, is_running);
+
+        if (socketd_append_image_record(&records, &record_count,
+                                        &capacity, &record) < 0) {
+          socketd_free_loaded_config(&cfg);
+          closedir(containers_dir);
+          free(records);
+          socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR,
+                                NULL, 0);
+          return;
+        }
+
+        socketd_free_loaded_config(&cfg);
+      }
+
+      closedir(containers_dir);
+    } else if (errno != ENOENT) {
+      free(records);
+      socketd_send_response(conn, DS_SOCKETD_STATUS_INTERNAL_ERROR, NULL, 0);
+      return;
     }
 
     uint32_t payload_bytes =
