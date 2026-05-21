@@ -67,7 +67,7 @@
  * ---------------------------------------------------------------------------*/
 
 #define DS_PROJECT_NAME "Droidspaces"
-#define DS_VERSION "6.1.5"
+#define DS_VERSION "6.2.0"
 #define DS_MIN_KERNEL_MAJOR 3
 #define DS_MIN_KERNEL_MINOR 10
 #define DS_RECOMMENDED_KERNEL_MAJOR 4
@@ -432,7 +432,8 @@ ds_init_type_t detect_container_init(const char *path);
 int get_user_shell(const char *user, char *shell_buf, size_t size);
 void check_kernel_recommendation(void);
 void write_monitor_debug_log(const char *name, const char *fmt, ...);
-void ds_socketd_record_core_event(const char *action, const char *container_name, const char *uuid);
+void ds_socketd_record_core_event(const char *action,
+                                  const char *container_name, const char *uuid);
 int copy_file(const char *src, const char *dst);
 void sort_bind_mounts(struct ds_config *cfg);
 void sanitize_container_name(const char *name, char *out, size_t size);
