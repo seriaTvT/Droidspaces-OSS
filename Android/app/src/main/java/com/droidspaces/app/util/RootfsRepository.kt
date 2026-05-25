@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
+import android.os.Build
 import org.json.JSONArray
 import java.net.HttpURLConnection
 import java.net.URL
@@ -25,6 +26,18 @@ data class RootfsAsset(
 sealed class RepoResult {
     data class Success(val assets: List<RootfsAsset>) : RepoResult()
     data class Error(val message: String) : RepoResult()
+}
+
+/** Maps the device's primary ABI to the arch string used in rootfs.json. */
+fun deviceArch(): String {
+    val abi = Build.SUPPORTED_ABIS[0]
+    return when {
+        abi.contains("arm64") || abi.contains("aarch64") -> "aarch64"
+        abi.contains("armeabi") || abi.contains("arm")   -> "armhf"
+        abi.contains("x86_64")                           -> "x86_64"
+        abi.contains("x86")                              -> "x86"
+        else                                             -> "aarch64"
+    }
 }
 
 object RootfsRepository {
@@ -57,8 +70,11 @@ object RootfsRepository {
             }
         }
 
+        val arch = deviceArch()
+        val filtered = allAssets.filter { it.architecture == arch }
+
         return@withContext when {
-            allAssets.isNotEmpty() -> RepoResult.Success(allAssets)
+            filtered.isNotEmpty() -> RepoResult.Success(filtered)
             errors.isNotEmpty()    -> RepoResult.Error(errors.joinToString("\n"))
             else                   -> RepoResult.Error(context.getString(R.string.repo_error_no_assets))
         }
