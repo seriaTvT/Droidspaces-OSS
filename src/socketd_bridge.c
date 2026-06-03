@@ -296,7 +296,7 @@ static int socketd_load_config_by_ref(const char *ref, struct ds_config *cfg) {
   }
 
   if (!socketd_is_uuid_prefix_ref(ref))
-    return DS_SOCKETD_STATUS_BAD_REQUEST;
+    return DS_SOCKETD_STATUS_NOT_FOUND;
 
   char containers_path[PATH_MAX];
   snprintf(containers_path, sizeof(containers_path), "%s/Containers",
