@@ -746,9 +746,7 @@ int start_rootfs(struct ds_config *cfg) {
        * handles this. Let's just return error so parent doesn't report
        * success.
        */
-      free_config_binds(cfg);
-      free_config_env_vars(cfg);
-      free_config_unknown_lines(cfg);
+      ds_config_free(cfg);
       goto cleanup;
     }
 
@@ -766,9 +764,7 @@ int start_rootfs(struct ds_config *cfg) {
 
   if (lock_acquired)
     release_external_lock(cfg->container_name);
-  free_config_binds(cfg);
-  free_config_env_vars(cfg);
-  free_config_unknown_lines(cfg);
+  ds_config_free(cfg);
 
   return 0;
 
@@ -792,9 +788,7 @@ cleanup:
   if (sync_pipe[1] >= 0)
     close(sync_pipe[1]);
 
-  free_config_binds(cfg);
-  free_config_env_vars(cfg);
-  free_config_unknown_lines(cfg);
+  ds_config_free(cfg);
   return -1;
 }
 

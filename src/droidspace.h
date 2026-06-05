@@ -515,6 +515,7 @@ int ds_config_add_bind(struct ds_config *cfg, const char *src, const char *dest,
 void free_config_binds(struct ds_config *cfg);
 void free_config_env_vars(struct ds_config *cfg);
 void free_config_unknown_lines(struct ds_config *cfg);
+void ds_config_free(struct ds_config *cfg);
 int ds_split_flags(const char *str, char ***out_argv, int *out_argc);
 void ds_free_split_flags(char **argv, int argc);
 char *ds_config_auto_path(const char *rootfs_path);

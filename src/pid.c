@@ -826,9 +826,7 @@ int ds_feature_needs(size_t cfg_flag_offset) {
       int flag = *(int *)((char *)&tmp + cfg_flag_offset);
       pid_t pid;
       int running = flag && is_container_running(&tmp, &pid);
-      free_config_binds(&tmp);
-      free_config_env_vars(&tmp);
-      free_config_unknown_lines(&tmp);
+      ds_config_free(&tmp);
       if (running) {
         closedir(pd);
         return 1;
@@ -854,14 +852,10 @@ int ds_feature_needs(size_t cfg_flag_offset) {
       int flag = *(int *)((char *)&tmp + cfg_flag_offset);
       if (flag) {
         installed = 1;
-        free_config_binds(&tmp);
-        free_config_env_vars(&tmp);
-        free_config_unknown_lines(&tmp);
+        ds_config_free(&tmp);
         break;
       }
-      free_config_binds(&tmp);
-      free_config_env_vars(&tmp);
-      free_config_unknown_lines(&tmp);
+      ds_config_free(&tmp);
     }
   }
   closedir(cd);

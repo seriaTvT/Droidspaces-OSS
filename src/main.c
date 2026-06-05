@@ -1199,9 +1199,7 @@ int main(int argc, char **argv) {
   ret = 1;
 
 cleanup:
-  free_config_unknown_lines(&cfg);
-  free_config_env_vars(&cfg);
-  free_config_binds(&cfg);
+  ds_config_free(&cfg);
   free(cfg.tx11_extra_flags);
   free(cfg.virgl_extra_flags);
   return ret;
