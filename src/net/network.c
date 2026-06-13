@@ -1019,6 +1019,43 @@ int setup_veth_child_side_named(struct ds_config *cfg, const char *peer_name,
 /* Compatibility wrapper */
 
 /* ---------------------------------------------------------------------------
+ * /etc/resolv.conf wiring (inside container, after pivot_root)
+ *
+ * Single source of truth for the container's resolver. Two cases:
+ *
+ *   1. gateway mode + no custom --dns + systemd container:
+ *      DNS is owned by the gateway's DHCP/DNS (e.g. OpenWrt). systemd-resolved
+ *      (fed by the lease) publishes it at /run/systemd/resolve/resolv.conf, so
+ *      we only point the symlink there - resolved owns the file. (A non-systemd
+ *      gateway has no resolved, so it falls through to case 2 with default
+ * DNS.)
+ *
+ *   2. everything else (nat/host/none, or any mode with custom --dns):
+ *      Droidspaces owns DNS. Write our content (custom or default) to
+ *      /run/droidspaces/resolv.conf and symlink it.
+ *
+ * This replaces the old /run/resolvconf duct-tape, which clobbered the distro's
+ * resolver and left a dangling symlink in gateway mode.
+ * ---------------------------------------------------------------------------*/
+static void setup_resolv_conf(struct ds_config *cfg) {
+  const char *target;
+
+  if (cfg->net_mode == DS_NET_GATEWAY && !cfg->dns_servers[0] &&
+      is_systemd_rootfs("/")) {
+    target = "/run/systemd/resolve/resolv.conf";
+  } else {
+    mkdir("/run/droidspaces", 0755);
+    write_file("/run/droidspaces/resolv.conf", cfg->dns_server_content);
+    target = "/run/droidspaces/resolv.conf";
+  }
+
+  unlink("/etc/resolv.conf");
+  if (symlink(target, "/etc/resolv.conf") < 0)
+    ds_warn("Failed to link /etc/resolv.conf -> %s: %s", target,
+            strerror(errno));
+}
+
+/* ---------------------------------------------------------------------------
  * Rootfs-side networking setup (inside container, after pivot_root)
  * ---------------------------------------------------------------------------*/
 
@@ -1062,19 +1099,8 @@ int fix_networking_rootfs(struct ds_config *cfg) {
 
   write_file("/etc/hosts", hosts_content);
 
-  /* 3. resolv.conf.  In gateway mode, DNS is owned by the gateway
-   * container's DHCP/DNS service, so avoid overwriting resolver state unless
-   * the user explicitly supplied --dns. */
-  if (cfg->net_mode != DS_NET_GATEWAY || cfg->dns_servers[0]) {
-    mkdir("/run/resolvconf", 0755);
-    write_file("/run/resolvconf/resolv.conf", cfg->dns_server_content);
-
-    /* Link /etc/resolv.conf */
-    unlink("/etc/resolv.conf");
-    if (symlink("/run/resolvconf/resolv.conf", "/etc/resolv.conf") < 0) {
-      ds_warn("Failed to link /etc/resolv.conf: %s", strerror(errno));
-    }
-  }
+  /* 3. resolv.conf (unified resolver wiring - see setup_resolv_conf). */
+  setup_resolv_conf(cfg);
 
   if (!ipv6_enabled) {
     if (cfg->net_mode == DS_NET_HOST) {
