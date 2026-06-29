@@ -21,20 +21,33 @@
 #include <net/if.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 
 /* ---------------------------------------------------------------------------
  * Internal helpers
  * ---------------------------------------------------------------------------*/
 
-/* Derive the host-side veth name from a container init PID */
-static void veth_host_name(pid_t pid, char *buf, size_t sz) {
-  snprintf(buf, sz, "ds-v%d", (int)pid);
+/* Host-side veth prefix for an application container.  NAT containers use
+ * "ds-v"; gateway clients use "ds-c" so the NAT-mode "last container" refcount
+ * (which scans for "ds-v") never miscounts a gateway client as a live NAT
+ * container and so keeps shared NAT iptables/route rules alive forever. */
+static const char *app_veth_host_prefix(const struct ds_config *cfg) {
+  return (cfg && cfg->net_mode == DS_NET_GATEWAY) ? "ds-c" : "ds-v";
 }
 
-/* Derive the peer (container-side) veth name from a container init PID */
-static void veth_peer_name(pid_t pid, char *buf, size_t sz) {
-  snprintf(buf, sz, "ds-p%d", (int)pid);
+/* Derive the host-side veth name from a container init PID (mode-aware). */
+static void veth_host_name(const struct ds_config *cfg, pid_t pid, char *buf,
+                           size_t sz) {
+  snprintf(buf, sz, "%s%d", app_veth_host_prefix(cfg), (int)pid);
+}
+
+/* Derive the peer (container-side) veth name from a container init PID.
+ * Gateway clients use "ds-q" to match the distinct host-side prefix. */
+static void veth_peer_name(const struct ds_config *cfg, pid_t pid, char *buf,
+                           size_t sz) {
+  const char *p = (cfg && cfg->net_mode == DS_NET_GATEWAY) ? "ds-q" : "ds-p";
+  snprintf(buf, sz, "%s%d", p, (int)pid);
 }
 
 /* Derive a deterministic IP from a PID (avoids sequential collisions) */
@@ -76,6 +89,24 @@ static void ds_container_mac(const char *name, uint8_t mac[6]) {
   snprintf(salted, sizeof(salted), "ds-mac:%s", name ? name : "");
   uint32_t h2 = ds_net_hash_string(salted);
   mac[0] = 0x02; /* locally administered (bit1), unicast (bit0 clear) */
+  mac[1] = (uint8_t)(h1 >> 24);
+  mac[2] = (uint8_t)(h1 >> 16);
+  mac[3] = (uint8_t)(h1 >> 8);
+  mac[4] = (uint8_t)(h1);
+  mac[5] = (uint8_t)(h2);
+}
+
+/* Derive a stable MAC for a gateway LAN-side veth from its segment key
+ * ("{gateway}:{net}").  The gateway's LAN interface (e.g. eth1 inside OpenWrt)
+ * then keeps the same MAC every time the cable is (re)plugged - across gateway
+ * reboots and self-heal re-wiring - so netifd sees one persistent device
+ * instead of re-initialising a new random-MAC device each time. */
+static void ds_segment_mac(const char *key, uint8_t mac[6]) {
+  uint32_t h1 = ds_net_hash_string(key);
+  char salted[400];
+  snprintf(salted, sizeof(salted), "ds-gwmac:%s", key ? key : "");
+  uint32_t h2 = ds_net_hash_string(salted);
+  mac[0] = 0x02; /* locally administered, unicast */
   mac[1] = (uint8_t)(h1 >> 24);
   mac[2] = (uint8_t)(h1 >> 16);
   mac[3] = (uint8_t)(h1 >> 8);
@@ -160,8 +191,9 @@ static int ds_netns_rename_up(const char *netns_path, const char *old_name,
   }
 
   if (new_name && new_name[0] && ds_nl_link_exists(ctx, new_name)) {
-    ds_log("[NET] Gateway: interface %s already exists inside gateway",
-           new_name);
+    /* Already present under its final name inside the gateway - the common,
+     * healthy case: the atomic move+rename created it, or this is an idempotent
+     * re-entry.  Just make sure it is up; the caller logs "uplink ready". */
     ds_nl_link_up(ctx, new_name);
   } else if (old_name && old_name[0] && new_name && new_name[0] &&
              strcmp(old_name, new_name) != 0) {
@@ -193,6 +225,8 @@ static int g_current_gw_table = 0;
 static pthread_mutex_t g_gw_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_route_monitor_sock = -1;
 static volatile sig_atomic_t g_stop_monitor = 0;
+static pthread_t g_route_monitor_tid;
+static int g_route_monitor_started = 0; /* guarded by g_gw_mutex */
 
 /* Returns 1 if ifname exists and is both UP and RUNNING.
  * On Android, the active data interface has IFF_RUNNING set; an interface
@@ -252,7 +286,7 @@ static int uplink_name_excluded(const char *ifname) {
 
 void ds_net_derive_handshake(pid_t init_pid, struct ds_config *cfg,
                              struct ds_net_handshake *hs) {
-  veth_peer_name(init_pid, hs->peer_name, sizeof(hs->peer_name));
+  veth_peer_name(cfg, init_pid, hs->peer_name, sizeof(hs->peer_name));
   /* Use the already-resolved static IP - not the PID-hash fallback.
    * ip_str is informational on the child side (voided in
    * setup_veth_child_side_named) but the boot.c log line prints it,
@@ -614,8 +648,8 @@ int ds_net_disable_tx_checksum(const char *ifname) {
 
 int setup_veth_host_side(struct ds_config *cfg, pid_t child_pid) {
   char veth_host[IFNAMSIZ], veth_peer[IFNAMSIZ];
-  veth_host_name(child_pid, veth_host, sizeof(veth_host));
-  veth_peer_name(child_pid, veth_peer, sizeof(veth_peer));
+  veth_host_name(cfg, child_pid, veth_host, sizeof(veth_host));
+  veth_peer_name(cfg, child_pid, veth_peer, sizeof(veth_peer));
 
   ds_log("Setting up host-side NAT networking for %s (PID %d)...",
          cfg->container_name, (int)child_pid);
@@ -815,16 +849,308 @@ int setup_veth_host_side(struct ds_config *cfg, pid_t child_pid) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Gateway segment lock
+ *
+ * One advisory file lock per delegated LAN segment (keyed on the bridge name).
+ * Serialises (re)creation of the single shared gateway-side veth + bridge
+ * across the independent monitor processes that touch a segment - concurrent
+ * client starts, and the gateway re-wiring its clients on (re)boot - so they
+ * cannot race each other into EEXIST half-states.
+ * ---------------------------------------------------------------------------*/
+
+static int gateway_segment_lock(const char *bridge) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "%s/gw_%s.lock", get_net_dir(), bridge);
+  int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    ds_warn("[NET] Gateway: could not open segment lock %s: %s", path,
+            strerror(errno));
+    return -1;
+  }
+  if (flock(fd, LOCK_EX) < 0) {
+    ds_warn("[NET] Gateway: flock failed on %s: %s", path, strerror(errno));
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static void gateway_segment_unlock(int fd) {
+  if (fd < 0)
+    return;
+  flock(fd, LOCK_UN);
+  close(fd);
+}
+
+/* ---------------------------------------------------------------------------
+ * Gateway liveness
+ * ---------------------------------------------------------------------------*/
+
+/* Resolve the gateway container's init pid, or 0 if it is not running. */
+static pid_t gateway_pid_of(const char *name) {
+  struct ds_config c;
+  memset(&c, 0, sizeof(c));
+  c.net_ready_pipe[0] = c.net_ready_pipe[1] = -1;
+  c.net_done_pipe[0] = c.net_done_pipe[1] = -1;
+  safe_strncpy(c.container_name, name, sizeof(c.container_name));
+  (void)ds_config_load_by_name(name, &c);
+  pid_t p = 0;
+  if (!is_container_running(&c, &p))
+    p = 0;
+  ds_config_free(&c);
+  return p > 0 ? p : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * gateway_ensure_lan_uplink_locked
+ *
+ * Ensure the shared half of a delegated LAN segment is wired into the running
+ * gateway container.  The caller holds the segment lock and has already
+ * confirmed the gateway is up, passing its netns pid:
+ *   - create/reuse the IP-less, policy-neutral bridge
+ *   - ensure the gateway-side veth (ds-g<hash>) exists with its peer living in
+ *     the gateway netns as gw_if (e.g. eth1)
+ *
+ * Idempotent: a live ds-g<hash> implies a live peer (veth pairs die together),
+ * so a repeat call is a cheap reattach.  When the cable is absent we plug a
+ * fresh one into the gateway's (possibly just-rebooted) netns - this is what
+ * heals clients after a gateway restart, with no client restart.
+ *
+ * Returns 0 when the gateway-side cable is up, -1 on a netlink failure.
+ * ---------------------------------------------------------------------------*/
+
+static int gateway_ensure_lan_uplink_locked(struct ds_config *cfg,
+                                            pid_t gw_pid) {
+  if (!cfg || !cfg->gateway_container[0] || gw_pid <= 0)
+    return -1;
+
+  const char *gw_if = gateway_lan_ifname(cfg);
+  if (strlen(gw_if) >= IFNAMSIZ || !gateway_ifname_component_ok(gw_if)) {
+    ds_warn("[NET] Gateway: invalid gateway interface name '%s'", gw_if);
+    return -1;
+  }
+
+  char bridge[IFNAMSIZ], gw_host[IFNAMSIZ], gw_peer[IFNAMSIZ];
+  gateway_bridge_name(cfg, bridge, sizeof(bridge));
+  gateway_veth_names(cfg, gw_host, sizeof(gw_host), gw_peer, sizeof(gw_peer));
+
+  ds_nl_ctx_t *ctx = ds_nl_open();
+  if (!ctx) {
+    ds_warn("[NET] Gateway: failed to open RTNETLINK socket");
+    return -1;
+  }
+
+  /* Bridge first, unconditionally: an IP-less, policy-neutral switch.  Disable
+   * bridge netfilter calls so OpenWrt's own firewalling stays the only policy
+   * authority on the delegated network. */
+  if (!ds_nl_link_exists(ctx, bridge)) {
+    ds_log("[NET] Gateway: creating delegated LAN bridge %s", bridge);
+    if (ds_nl_create_bridge(ctx, bridge) < 0) {
+      ds_warn("[NET] Gateway: failed to create bridge %s", bridge);
+      ds_nl_close(ctx);
+      return -1;
+    }
+  }
+  if (ds_nl_link_up(ctx, bridge) < 0)
+    ds_warn("[NET] Gateway: failed to bring up bridge %s", bridge);
+  write_file("/proc/sys/net/bridge/bridge-nf-call-iptables", "0");
+  write_file("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "0");
+
+  /* Cable already present → live gateway peer → just re-assert master + up.
+   * This is the idempotent no-op path when the segment is already healthy. */
+  if (ds_nl_link_exists(ctx, gw_host)) {
+    if (ds_nl_set_master(ctx, gw_host, bridge) < 0)
+      ds_warn("[NET] Gateway: failed to reattach %s to %s", gw_host, bridge);
+    ds_nl_link_up(ctx, gw_host);
+    ds_nl_close(ctx);
+    return 0;
+  }
+
+  char gw_netns[PATH_MAX];
+  snprintf(gw_netns, sizeof(gw_netns), "/proc/%d/ns/net", (int)gw_pid);
+
+  ds_log("[NET] Gateway: creating gateway veth %s <-> %s", gw_host, gw_peer);
+  if (ds_nl_create_veth(ctx, gw_host, gw_peer) < 0) {
+    ds_warn("[NET] Gateway: failed to create gateway veth pair");
+    ds_nl_close(ctx);
+    return -1;
+  }
+
+  /* Pin a stable, segment-derived MAC on the gateway-facing peer (becomes gw_if
+   * inside the gateway) so netifd sees one persistent device across every
+   * re-plug.  Set while down, before the move. */
+  {
+    char key[384];
+    uint8_t mac[6];
+    gateway_hash_key(cfg, key, sizeof(key));
+    ds_segment_mac(key, mac);
+    if (ds_nl_set_mac(ctx, gw_peer, mac) < 0)
+      ds_warn("[NET] Gateway: failed to pin MAC on %s", gw_peer);
+  }
+
+  ds_net_disable_tx_checksum(gw_host);
+  if (ds_nl_set_master(ctx, gw_host, bridge) < 0)
+    ds_warn("[NET] Gateway: failed to attach %s to %s", gw_host, bridge);
+  if (ds_nl_link_up(ctx, gw_host) < 0)
+    ds_warn("[NET] Gateway: failed to bring up %s", gw_host);
+
+  int gw_netns_fd = open(gw_netns, O_RDONLY | O_CLOEXEC);
+  if (gw_netns_fd < 0) {
+    ds_warn("[NET] Gateway: failed to open %s: %s", gw_netns, strerror(errno));
+    ds_nl_del_link(ctx, gw_host); /* drop the half-built pair */
+    ds_nl_close(ctx);
+    return -1;
+  }
+
+  /* Atomic move+rename: the peer appears inside the gateway already named
+   * gw_if, so there is no transient raw-name device for netifd to race against
+   * ("device initialization failed").  Fall back to a plain move on failure. */
+  if (ds_nl_move_to_netns_named(ctx, gw_peer, gw_netns_fd, gw_if) != 0) {
+    ds_warn("[NET] Gateway: atomic move+rename of %s failed - falling back",
+            gw_peer);
+    if (ds_nl_move_to_netns(ctx, gw_peer, gw_netns_fd) < 0) {
+      ds_warn("[NET] Gateway: fallback move of %s into gateway netns failed",
+              gw_peer);
+      close(gw_netns_fd);
+      ds_nl_close(ctx);
+      return -1;
+    }
+  }
+  close(gw_netns_fd);
+  ds_nl_close(ctx);
+
+  /* Bring it up inside the gateway under its final name (the atomic path
+   * already renamed it; the fallback path renames here). */
+  if (ds_netns_rename_up(gw_netns, gw_peer, gw_if) < 0)
+    ds_warn("[NET] Gateway: moved %s but could not bring it up as %s", gw_peer,
+            gw_if);
+
+  ds_log("[NET] Gateway: LAN uplink ready on %s -> %s (%s)", bridge,
+         cfg->gateway_container, gw_if);
+  return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * gateway_wire_client
+ *
+ * Fully wire ONE gateway-mode client into its delegated LAN, entirely from the
+ * host side.  Because the host owns every step - including renaming the peer to
+ * eth0 and bringing it up *inside* the client netns - this works identically
+ * whether the client is just starting (its netns fresh, child blocked on the
+ * handshake) or already running (the gateway came up later and is re-wiring
+ * it). The gateway-mode child only brings up lo; it never touches eth0.
+ *
+ * Under the segment lock: ensure bridge + gateway uplink, create the app veth,
+ * pin the client's stable MAC, attach the host end to the bridge, then
+ * move+rename the peer into the client netns as eth0 (up).  Returns 0 on
+ * success.  Caller passes the client's init pid and the confirmed-running
+ * gateway's init pid.
+ * ---------------------------------------------------------------------------*/
+
+static int gateway_wire_client(struct ds_config *cfg, pid_t client_pid,
+                               pid_t gateway_pid) {
+  if (!cfg || client_pid <= 0 || gateway_pid <= 0)
+    return -1;
+
+  char bridge[IFNAMSIZ], app_host[IFNAMSIZ], app_peer[IFNAMSIZ];
+  gateway_bridge_name(cfg, bridge, sizeof(bridge));
+  veth_host_name(cfg, client_pid, app_host, sizeof(app_host));
+  veth_peer_name(cfg, client_pid, app_peer, sizeof(app_peer));
+
+  /* One lock spans the shared uplink AND this client's app-veth attach, so a
+   * concurrent client's cleanup cannot reap the bridge between them. */
+  int lock = gateway_segment_lock(bridge);
+  int ret = -1;
+
+  if (gateway_ensure_lan_uplink_locked(cfg, gateway_pid) < 0) {
+    ds_warn("[NET] Gateway: uplink for %s not ready - cannot wire '%s'", bridge,
+            cfg->container_name);
+    goto out;
+  }
+
+  ds_nl_ctx_t *ctx = ds_nl_open();
+  if (!ctx) {
+    ds_warn("[NET] Gateway: failed to open RTNETLINK socket");
+    goto out;
+  }
+
+  ds_nl_del_link(ctx, app_host); /* drop any stale half from a prior wiring */
+  ds_log("[NET] Gateway: creating app veth %s <-> %s", app_host, app_peer);
+  if (ds_nl_create_veth(ctx, app_host, app_peer) < 0) {
+    ds_warn("[NET] Gateway: failed to create app veth pair");
+    ds_nl_close(ctx);
+    goto out;
+  }
+
+  /* Pin the client's stable, name-derived MAC on the peer (becomes eth0) before
+   * the move, so the gateway's DHCP leases see one host across reboots. */
+  {
+    uint8_t mac[6];
+    ds_container_mac(cfg->container_name, mac);
+    if (ds_nl_set_mac(ctx, app_peer, mac) < 0)
+      ds_warn("[NET] Gateway: failed to pin MAC on %s", app_peer);
+  }
+
+  ds_net_disable_tx_checksum(app_host);
+  if (ds_nl_set_master(ctx, app_host, bridge) < 0)
+    ds_warn("[NET] Gateway: failed to attach %s to %s", app_host, bridge);
+  if (ds_nl_link_up(ctx, app_host) < 0)
+    ds_warn("[NET] Gateway: failed to bring up %s", app_host);
+
+  char netns[PATH_MAX];
+  snprintf(netns, sizeof(netns), "/proc/%d/ns/net", (int)client_pid);
+  int netns_fd = open(netns, O_RDONLY | O_CLOEXEC);
+  if (netns_fd < 0) {
+    ds_warn("[NET] Gateway: failed to open client netns %s: %s", netns,
+            strerror(errno));
+    ds_nl_del_link(ctx, app_host);
+    ds_nl_close(ctx);
+    goto out;
+  }
+
+  /* Atomic move+rename into the client as eth0 (no transient raw-name device
+   * for the container's own DHCP/networkd to race), with a plain-move fallback.
+   */
+  if (ds_nl_move_to_netns_named(ctx, app_peer, netns_fd, "eth0") != 0) {
+    ds_warn("[NET] Gateway: atomic move+rename of %s failed - falling back",
+            app_peer);
+    if (ds_nl_move_to_netns(ctx, app_peer, netns_fd) < 0) {
+      ds_warn("[NET] Gateway: move of %s into client netns failed", app_peer);
+      close(netns_fd);
+      ds_nl_del_link(ctx, app_host);
+      ds_nl_close(ctx);
+      goto out;
+    }
+  }
+  close(netns_fd);
+  ds_nl_close(ctx);
+
+  if (ds_netns_rename_up(netns, app_peer, "eth0") < 0)
+    ds_warn("[NET] Gateway: wired '%s' but could not bring up its eth0",
+            cfg->container_name);
+
+  ret = 0;
+  ds_log("Gateway: wiring complete for '%s': %s -> %s", cfg->container_name,
+         bridge, cfg->gateway_container);
+
+out:
+  gateway_segment_unlock(lock);
+  return ret;
+}
+
+/* ---------------------------------------------------------------------------
  * setup_gateway_veth_side
  *
- * Phase-1 OpenWrt gateway mode.  Droidspaces owns only the L2 plumbing:
- *   - create/reuse a bridge-only LAN with no IP address
- *   - attach one veth peer to the designated gateway container netns
- *   - attach one veth peer to the application container netns
+ * Called at client start.  OpenWrt gateway mode: Droidspaces owns only the L2
+ * plumbing (bridge + veths), never NAT/DHCP/DNS/firewall - the gateway
+ * container runs that policy.
  *
- * No NAT, DHCP, DNS, port-forwarding, Android policy routing, or firewall
- * policy is installed here.  The gateway container is expected to run the
- * routing policy engine (OpenWrt netifd/firewall/dnsmasq/etc.).
+ * If the gateway is already running we wire this client now.  If it is NOT
+ * running we skip ALL networking and return: the gateway wires every running
+ * client itself when it (re)boots (ds_net_rewire_gateway_clients).  Deferring
+ * instead of half-wiring also closes a race - a client started before its
+ * gateway must not bake in gateway/LAN settings the user may still edit before
+ * the gateway comes up.
  * ---------------------------------------------------------------------------*/
 
 int setup_gateway_veth_side(struct ds_config *cfg, pid_t child_pid) {
@@ -838,158 +1164,63 @@ int setup_gateway_veth_side(struct ds_config *cfg, pid_t child_pid) {
     return -1;
   }
 
-  const char *gw_if = gateway_lan_ifname(cfg);
-  if (strlen(gw_if) >= IFNAMSIZ || !gateway_ifname_component_ok(gw_if)) {
-    ds_warn("[NET] Gateway: invalid gateway interface name '%s'", gw_if);
-    return -1;
+  pid_t gw_pid = gateway_pid_of(cfg->gateway_container);
+  if (gw_pid <= 0) {
+    ds_warn("Gateway: '%s' not running - deferring all networking for "
+            "'%s'; the gateway will wire it when it starts",
+            cfg->gateway_container, cfg->container_name);
+    return 0;
   }
 
-  struct ds_config gw_cfg;
-  memset(&gw_cfg, 0, sizeof(gw_cfg));
-  gw_cfg.net_ready_pipe[0] = gw_cfg.net_ready_pipe[1] = -1;
-  gw_cfg.net_done_pipe[0] = gw_cfg.net_done_pipe[1] = -1;
-  safe_strncpy(gw_cfg.container_name, cfg->gateway_container,
-               sizeof(gw_cfg.container_name));
+  ds_log("[NET] Gateway: wiring '%s' to gateway '%s'", cfg->container_name,
+         cfg->gateway_container);
+  return gateway_wire_client(cfg, child_pid, gw_pid);
+}
 
-  /* Best effort: loading the config gives UUID fallback discovery, but the
-   * fast pidfile path still works when the config file is unavailable. */
-  (void)ds_config_load_by_name(cfg->gateway_container, &gw_cfg);
+/* ---------------------------------------------------------------------------
+ * ds_net_rewire_gateway_clients
+ *
+ * Gateway self-heal, driven by the gateway itself.  On every boot the gateway
+ * container's monitor calls this: it scans the running containers for the ones
+ * that delegate to this gateway and (re)wires each into the gateway's current
+ * netns via gateway_wire_client.  That one function also idempotently ensures
+ * the shared LAN uplink, so a single pass covers the gateway-side cable and
+ * every client's app veth.
+ *
+ * This restores clients after the gateway (re)boots - its old netns died and
+ * took the LAN cable with it - and wires clients that were started while the
+ * gateway was down.  One actor, no client restart.
+ * ---------------------------------------------------------------------------*/
+void ds_net_rewire_gateway_clients(const char *gateway_name,
+                                   pid_t gateway_pid) {
+  if (!gateway_name || !gateway_name[0] || gateway_pid <= 0)
+    return;
 
-  pid_t gw_pid = 0;
-  if (!is_container_running(&gw_cfg, &gw_pid) || gw_pid <= 0) {
-    ds_warn("[NET] Gateway: container '%s' is not running",
-            cfg->gateway_container);
-    ds_config_free(&gw_cfg);
-    return -1;
+  char containers_dir[PATH_MAX];
+  snprintf(containers_dir, sizeof(containers_dir), "%s/Containers",
+           get_workspace_dir());
+  DIR *d = opendir(containers_dir);
+  if (!d)
+    return;
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] == '.')
+      continue;
+
+    struct ds_config c = {0};
+    if (ds_config_load_by_name(ent->d_name, &c) != 0)
+      continue;
+
+    pid_t p = 0;
+    if (c.net_mode == DS_NET_GATEWAY && c.gateway_container[0] &&
+        strcmp(c.gateway_container, gateway_name) == 0 &&
+        is_container_running(&c, &p) && p > 0)
+      gateway_wire_client(&c, p, gateway_pid);
+
+    ds_config_free(&c);
   }
-
-  char bridge[IFNAMSIZ];
-  char gw_host[IFNAMSIZ], gw_peer[IFNAMSIZ];
-  char app_host[IFNAMSIZ], app_peer[IFNAMSIZ];
-  gateway_bridge_name(cfg, bridge, sizeof(bridge));
-  gateway_veth_names(cfg, gw_host, sizeof(gw_host), gw_peer, sizeof(gw_peer));
-  veth_host_name(child_pid, app_host, sizeof(app_host));
-  veth_peer_name(child_pid, app_peer, sizeof(app_peer));
-
-  ds_log("[NET] Gateway: wiring %s to gateway %s via bridge %s",
-         cfg->container_name, cfg->gateway_container, bridge);
-
-  ds_nl_ctx_t *ctx = ds_nl_open();
-  if (!ctx) {
-    ds_warn("[NET] Gateway: failed to open RTNETLINK socket");
-    ds_config_free(&gw_cfg);
-    return -1;
-  }
-
-  if (!ds_nl_link_exists(ctx, bridge)) {
-    ds_log("[NET] Gateway: creating delegated LAN bridge %s", bridge);
-    if (ds_nl_create_bridge(ctx, bridge) < 0) {
-      ds_warn("[NET] Gateway: failed to create bridge %s", bridge);
-      ds_nl_close(ctx);
-      ds_config_free(&gw_cfg);
-      return -1;
-    }
-  }
-
-  if (ds_nl_link_up(ctx, bridge) < 0)
-    ds_warn("[NET] Gateway: failed to bring up bridge %s", bridge);
-
-  /* Keep the bridge policy-neutral: no address, no DHCP, no NAT.  Disable
-   * bridge netfilter calls so OpenWrt's own firewalling remains the visible
-   * policy authority inside the delegated network. */
-  write_file("/proc/sys/net/bridge/bridge-nf-call-iptables", "0");
-  write_file("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "0");
-
-  /* Lazily attach a LAN-side interface to the gateway if it is not already
-   * present.  This allows the gateway container to boot with its WAN side
-   * first, then receive its LAN cable when the first client is attached. */
-  if (!ds_nl_link_exists(ctx, gw_host)) {
-    char gw_netns[PATH_MAX];
-    snprintf(gw_netns, sizeof(gw_netns), "/proc/%d/ns/net", (int)gw_pid);
-
-    ds_log("[NET] Gateway: creating gateway veth %s <-> %s", gw_host, gw_peer);
-    if (ds_nl_create_veth(ctx, gw_host, gw_peer) < 0) {
-      ds_warn("[NET] Gateway: failed to create gateway veth pair");
-      ds_nl_close(ctx);
-      ds_config_free(&gw_cfg);
-      return -1;
-    }
-
-    ds_net_disable_tx_checksum(gw_host);
-    if (ds_nl_set_master(ctx, gw_host, bridge) < 0)
-      ds_warn("[NET] Gateway: failed to attach %s to %s", gw_host, bridge);
-    if (ds_nl_link_up(ctx, gw_host) < 0)
-      ds_warn("[NET] Gateway: failed to bring up %s", gw_host);
-
-    int gw_netns_fd = open(gw_netns, O_RDONLY | O_CLOEXEC);
-    if (gw_netns_fd < 0) {
-      ds_warn("[NET] Gateway: failed to open %s: %s", gw_netns,
-              strerror(errno));
-      ds_nl_close(ctx);
-      ds_config_free(&gw_cfg);
-      return -1;
-    }
-
-    int r = ds_nl_move_to_netns(ctx, gw_peer, gw_netns_fd);
-    close(gw_netns_fd);
-    if (r < 0) {
-      ds_warn("[NET] Gateway: failed to move %s into gateway netns", gw_peer);
-      ds_nl_close(ctx);
-      ds_config_free(&gw_cfg);
-      return -1;
-    }
-
-    if (ds_netns_rename_up(gw_netns, gw_peer, gw_if) < 0)
-      ds_warn("[NET] Gateway: moved %s but could not rename/up it as %s",
-              gw_peer, gw_if);
-  } else {
-    if (ds_nl_set_master(ctx, gw_host, bridge) < 0)
-      ds_warn("[NET] Gateway: failed to reattach %s to %s", gw_host, bridge);
-    ds_nl_link_up(ctx, gw_host);
-  }
-
-  /* Wire the application container into the delegated LAN bridge. */
-  ds_nl_del_link(ctx, app_host);
-  ds_log("[NET] Gateway: creating app veth %s <-> %s", app_host, app_peer);
-  if (ds_nl_create_veth(ctx, app_host, app_peer) < 0) {
-    ds_warn("[NET] Gateway: failed to create app veth pair");
-    ds_nl_close(ctx);
-    ds_config_free(&gw_cfg);
-    return -1;
-  }
-
-  ds_net_disable_tx_checksum(app_host);
-  if (ds_nl_set_master(ctx, app_host, bridge) < 0)
-    ds_warn("[NET] Gateway: failed to attach %s to %s", app_host, bridge);
-  if (ds_nl_link_up(ctx, app_host) < 0)
-    ds_warn("[NET] Gateway: failed to bring up %s", app_host);
-
-  char child_netns[PATH_MAX];
-  snprintf(child_netns, sizeof(child_netns), "/proc/%d/ns/net", (int)child_pid);
-  int child_netns_fd = open(child_netns, O_RDONLY | O_CLOEXEC);
-  if (child_netns_fd < 0) {
-    ds_warn("[NET] Gateway: failed to open container netns %s: %s", child_netns,
-            strerror(errno));
-    ds_nl_close(ctx);
-    ds_config_free(&gw_cfg);
-    return -1;
-  }
-
-  int r = ds_nl_move_to_netns(ctx, app_peer, child_netns_fd);
-  close(child_netns_fd);
-  if (r < 0) {
-    ds_warn("[NET] Gateway: failed to move %s into container netns", app_peer);
-    ds_nl_close(ctx);
-    ds_config_free(&gw_cfg);
-    return -1;
-  }
-
-  ds_nl_close(ctx);
-  ds_config_free(&gw_cfg);
-
-  ds_log("[NET] Gateway: delegated LAN ready: %s -> %s -> %s",
-         cfg->container_name, bridge, cfg->gateway_container);
-  return 0;
+  closedir(d);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1000,17 +1231,33 @@ int setup_gateway_veth_side(struct ds_config *cfg, pid_t child_pid) {
 
 int setup_veth_child_side_named(struct ds_config *cfg, const char *peer_name,
                                 const char *ip_str) {
-  (void)cfg;
   (void)ip_str; /* IP is now assigned by the container's own DHCP client */
-  ds_log("[DEBUG] Child: Configuring isolated networking. Local PID: %d, "
-         "Peer: %s",
-         (int)getpid(), peer_name ? peer_name : "(null)");
 
   ds_nl_ctx_t *ctx = ds_nl_open();
   if (!ctx) {
     ds_warn("[DEBUG] Child: Failed to open netlink socket");
     return -1;
   }
+
+  /* Gateway mode: the host monitor owns the entire app-veth wiring - it renames
+   * the peer to eth0, pins the MAC, and brings it up *inside* this netns - so
+   * the child only needs loopback.  This lets the gateway wire us identically
+   * whether we are starting now or already running when it (re)boots, and means
+   * a client started before its gateway simply has no eth0 until the gateway
+   * comes up and wires it. */
+  if (cfg && cfg->net_mode == DS_NET_GATEWAY) {
+    ds_nl_link_up(ctx, "lo");
+    ds_nl_close(ctx);
+    ds_log("[NET] Child: gateway mode - lo up; gateway container owns "
+           "eth0/DHCP/routing");
+    return 0;
+  }
+
+  /* NAT mode: the monitor moved the veth peer into this netns under its raw
+   * name; we rename it to eth0, pin the MAC, and bring it up. */
+  ds_log("[DEBUG] Child: configuring container veth (peer %s -> eth0, local "
+         "PID %d)",
+         peer_name ? peer_name : "(null)", (int)getpid());
 
   /* 0. Rename interface to eth0 */
   if (peer_name && peer_name[0] && strcmp(peer_name, "eth0") != 0) {
@@ -1039,10 +1286,7 @@ int setup_veth_child_side_named(struct ds_config *cfg, const char *peer_name,
   ds_nl_link_up(ctx, "eth0");
 
   ds_nl_close(ctx);
-  if (cfg && cfg->net_mode == DS_NET_GATEWAY)
-    ds_log("[NET] Child: eth0 UP - gateway container owns DHCP/routing");
-  else
-    ds_log("[NET] Child: eth0 UP - awaiting DHCP lease from monitor");
+  ds_log("[NET] Child: eth0 UP - awaiting DHCP lease from monitor");
   return 0;
 }
 
@@ -1070,9 +1314,23 @@ int setup_veth_child_side_named(struct ds_config *cfg, const char *peer_name,
 static void setup_resolv_conf(struct ds_config *cfg) {
   const char *target;
 
-  if (cfg->net_mode == DS_NET_GATEWAY && !cfg->dns_servers[0] &&
-      is_systemd_rootfs("/")) {
-    target = "/run/systemd/resolve/resolv.conf";
+  /* Gateway mode with no explicit --dns: DNS belongs to the gateway (OpenWrt
+   * dnsmasq), advertised in the DHCP lease.  Droidspaces must NOT write a
+   * static resolv.conf or it would bypass the gateway's DNS filtering/caching.
+   */
+  if (cfg->net_mode == DS_NET_GATEWAY && !cfg->dns_servers[0]) {
+    if (is_systemd_rootfs("/")) {
+      /* systemd-resolved consumes the lease and publishes the real resolver. */
+      target = "/run/systemd/resolve/resolv.conf";
+    } else {
+      /* Non-systemd: leave /etc/resolv.conf to the container's own DHCP client,
+       * which writes the gateway-supplied nameserver from the lease.  Writing a
+       * hardcoded 1.1.1.1/8.8.8.8 here would silently defeat the gateway's DNS
+       * (adblock, split-horizon, etc.).  Pass --dns to override. */
+      ds_log("[NET] Gateway: leaving /etc/resolv.conf to the container's DHCP "
+             "client (gateway owns DNS)");
+      return;
+    }
   } else {
     mkdir("/run/droidspaces", 0755);
     write_file("/run/droidspaces/resolv.conf", cfg->dns_server_content);
@@ -1519,28 +1777,48 @@ static void *route_monitor_loop(void *arg) {
 }
 
 void ds_net_stop_route_monitor(void) {
-  g_stop_monitor = 1;
   pthread_mutex_lock(&g_gw_mutex);
+  int started = g_route_monitor_started;
+  pthread_t tid = g_route_monitor_tid;
+  g_stop_monitor = 1;
   if (g_route_monitor_sock >= 0)
     shutdown(g_route_monitor_sock, SHUT_RDWR);
   pthread_mutex_unlock(&g_gw_mutex);
+
+  /* Join so the monitor is fully stopped before cleanup removes the shared
+   * MASQUERADE / FIB policy rules - otherwise an in-flight do_uplink_reprobe()
+   * could re-add a rule we just deleted, or rewrite ip_forward after teardown.
+   */
+  if (started) {
+    pthread_join(tid, NULL);
+    pthread_mutex_lock(&g_gw_mutex);
+    g_route_monitor_started = 0;
+    pthread_mutex_unlock(&g_gw_mutex);
+  }
 }
 
 void ds_net_start_route_monitor(void) {
   if (!is_android())
     return;
 
+  pthread_mutex_lock(&g_gw_mutex);
+  /* Idempotent: exactly one monitor thread per process.  setup_veth_host_side
+   * calls this on every boot cycle (including reboots, which never stop the
+   * monitor); without this guard each reboot would spawn another thread, all
+   * racing the same FIB policy rule.  The monitor tracks the host uplink, which
+   * is independent of the container PID, so a single instance rightly persists
+   * across the container's reboots.  Joinable (default attr) so stop can join.
+   */
+  if (g_route_monitor_started) {
+    pthread_mutex_unlock(&g_gw_mutex);
+    return;
+  }
   g_stop_monitor = 0;
-
-  pthread_t tid;
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-  if (pthread_create(&tid, &attr, route_monitor_loop, NULL) != 0)
+  if (pthread_create(&g_route_monitor_tid, NULL, route_monitor_loop, NULL) != 0)
     ds_warn("[NET] Failed to start route monitor thread: %s", strerror(errno));
-
-  pthread_attr_destroy(&attr);
+  else
+    g_route_monitor_started = 1;
+  pthread_mutex_unlock(&g_gw_mutex);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1557,37 +1835,43 @@ void ds_net_cleanup(struct ds_config *cfg, pid_t container_pid) {
     pid_t effective_pid =
         container_pid > 0 ? container_pid : cfg->container_pid;
     if (effective_pid > 0) {
-      veth_host_name(effective_pid, veth_host, sizeof(veth_host));
+      veth_host_name(cfg, effective_pid, veth_host, sizeof(veth_host));
+
+      char bridge[IFNAMSIZ];
+      gateway_bridge_name(cfg, bridge, sizeof(bridge));
+
+      /* Hold the segment lock across our veth removal + the client count +
+       * reap, so a concurrent client's setup (which holds the same lock while
+       * attaching its veth) cannot slip in between our count and our reap. */
+      int lock = gateway_segment_lock(bridge);
+
       ds_nl_del_link(ctx, veth_host);
       ds_log("[NET] Gateway cleanup: removed %s", veth_host);
 
-      /* Refcount the delegated bridge: once the last client veth has left,
-       * reap the now-empty bridge so idle segments don't linger. */
-      char bridge[IFNAMSIZ], gw_host[IFNAMSIZ], gw_peer[IFNAMSIZ];
-      gateway_bridge_name(cfg, bridge, sizeof(bridge));
-      gateway_veth_names(cfg, gw_host, sizeof(gw_host), gw_peer,
-                         sizeof(gw_peer));
-      int clients = ds_nl_count_bridge_members_with_prefix(ctx, bridge, "ds-v");
+      int clients = ds_nl_count_bridge_members_with_prefix(
+          ctx, bridge, app_veth_host_prefix(cfg));
       if (clients > 0) {
         ds_log("[NET] Gateway cleanup: %d client(s) still on %s - keeping "
                "delegated LAN",
                clients, bridge);
+      } else if (gateway_pid_of(cfg->gateway_container) > 0) {
+        /* No clients left, but the gateway is still up.  Do NOT reap the
+         * bridge: deleting it flaps the gateway's live LAN iface (eth1)
+         * carrier, and netifd occasionally fails to re-init it ("device
+         * initialization failed").  The IP-less, policy-free bridge is harmless
+         * idle and the next client reuses it; the gateway veth stays put. */
+        ds_log("[NET] Gateway cleanup: no clients on %s but gateway '%s' is up "
+               "- keeping bridge to avoid flapping its LAN iface",
+               bridge, cfg->gateway_container);
       } else {
-        /* Reap the empty bridge, but NEVER delete the gateway veth (gw_host):
-         * its peer is the gateway container's live LAN interface (e.g. eth1),
-         * and deleting either end destroys the pair - ripping the cable out of
-         * a still-running gateway.  OpenWrt's netifd will not re-init a brand
-         * new eth1 that reappears under it, so its DHCP/LAN stays dead until
-         * the gateway is rebooted.  Leaving gw_host masterless keeps eth1
-         * alive; the next client recreates the bridge and reattaches gw_host
-         * (setup_gateway_veth_side else-branch).  When the gateway container
-         * itself stops, its netns dies and gw_host vanishes with its peer,
-         * leaving zero residue. */
+        /* No clients and the gateway is gone (its netns death already took the
+         * gateway veth with its peer) - safe to reap the now-idle bridge. */
         ds_nl_del_link(ctx, bridge);
-        ds_log("[NET] Gateway cleanup: reaped idle delegated LAN bridge %s "
-               "(kept gateway veth %s)",
-               bridge, gw_host);
+        ds_log("[NET] Gateway cleanup: reaped idle delegated LAN bridge %s",
+               bridge);
       }
+
+      gateway_segment_unlock(lock);
     } else {
       ds_warn("[NET] Gateway cleanup: cannot derive veth name - no valid PID");
     }
@@ -1612,7 +1896,7 @@ void ds_net_cleanup(struct ds_config *cfg, pid_t container_pid) {
     ds_warn("[NET] cleanup: cannot derive veth name - no valid PID");
     /* still proceed with iptables cleanup */
   } else {
-    veth_host_name(effective_pid, veth_host, sizeof(veth_host));
+    veth_host_name(cfg, effective_pid, veth_host, sizeof(veth_host));
     ds_nl_del_link(ctx, veth_host);
   }
 

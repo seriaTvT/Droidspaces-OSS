@@ -681,6 +681,10 @@ void ds_net_derive_handshake(pid_t init_pid, struct ds_config *cfg,
                              struct ds_net_handshake *hs);
 void ds_net_cleanup(struct ds_config *cfg, pid_t container_pid);
 void ds_net_start_route_monitor(void);
+/* Gateway self-heal: when the gateway container (re)boots, re-wire its LAN
+ * cable to every running client that delegates to it, with no client restart.
+ * Called from the gateway container's monitor on each boot cycle. */
+void ds_net_rewire_gateway_clients(const char *gateway_name, pid_t gateway_pid);
 int ds_net_disable_tx_checksum(const char *ifname);
 void parse_cidr(const char *cidr, uint32_t *ip_out, uint32_t *mask_out);
 
@@ -708,6 +712,8 @@ int ds_nl_add_addr4(ds_nl_ctx_t *ctx, const char *ifname, uint32_t ip_be,
 int ds_nl_add_route4(ds_nl_ctx_t *ctx, uint32_t dst_be, uint8_t dst_len,
                      uint32_t gw_be, int oif_idx);
 int ds_nl_move_to_netns(ds_nl_ctx_t *ctx, const char *ifname, int netns_fd);
+int ds_nl_move_to_netns_named(ds_nl_ctx_t *ctx, const char *ifname,
+                              int netns_fd, const char *newname);
 int ds_nl_get_iface_table(ds_nl_ctx_t *ctx, const char *ifname, int *table_out);
 int ds_nl_get_table_default_oif(ds_nl_ctx_t *ctx, int table, char *ifname_out);
 int ds_nl_get_android_default(ds_nl_ctx_t *ctx, char *ifname_out,
