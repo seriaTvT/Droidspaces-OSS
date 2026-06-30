@@ -178,6 +178,17 @@ static int target_is_accept(const struct xt_entry_target *t) {
   return 0;
 }
 
+/* Human-readable target name for logging.  Standard targets (ACCEPT and the
+ * other built-in verdicts) carry an empty user.name - the verdict is encoded
+ * numerically - so decode the common ACCEPT case instead of printing ''. */
+static const char *target_label(const struct xt_entry_target *t) {
+  if (t->u.user.name[0])
+    return t->u.user.name;
+  if (target_is_accept(t))
+    return "ACCEPT";
+  return "standard";
+}
+
 /* ---------------------------------------------------------------------------
  * Internal: walk the blob to find an existing rule matching our fingerprint.
  *
@@ -543,7 +554,8 @@ static int remove_matching_rules(int fd, const char *table_name,
           ei++;
           continue;
         }
-        ds_log("[IPT] remove: dropping '%s' rule at offset %u", tname, offset);
+        ds_log("[IPT] remove: dropping '%s' rule at offset %u", target_label(t),
+               offset);
         cumulative_gone += e->next_offset;
         removed_count++;
       } else {
