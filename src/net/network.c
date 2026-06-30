@@ -79,34 +79,25 @@ static uint32_t ds_net_hash_string(const char *s) {
   return h;
 }
 
-/* Derive a stable, locally-administered unicast MAC from the container name.
- * The same name always yields the same address, so a gateway (e.g. OpenWrt)
- * sees one persistent host across restarts instead of a fresh random MAC -
- * and therefore one DHCP lease / LuCI entry - every boot. */
-static void ds_container_mac(const char *name, uint8_t mac[6]) {
-  uint32_t h1 = ds_net_hash_string(name);
-  char salted[300];
-  snprintf(salted, sizeof(salted), "ds-mac:%s", name ? name : "");
+/* Derive a stable, locally-administered unicast MAC from a key string, salted
+ * with a domain prefix so the two callers never collide on the same key.
+ *
+ *   "ds-mac:"   <container name>  - the container's own eth0.  A gateway (e.g.
+ *                                   OpenWrt) then sees one persistent host
+ *                                   across restarts - one DHCP lease / LuCI
+ *                                   entry - instead of a fresh random MAC.
+ *   "ds-gwmac:" <segment key>     - a gateway LAN-side veth (becomes e.g. eth1
+ *                                   inside OpenWrt).  Keeps the same MAC across
+ *                                   every (re)plug so netifd sees one
+ *                                   persistent device, not a new one each time.
+ */
+static void ds_derive_mac(const char *key, const char *salt_prefix,
+                          uint8_t mac[6]) {
+  uint32_t h1 = ds_net_hash_string(key);
+  char salted[512];
+  snprintf(salted, sizeof(salted), "%s%s", salt_prefix, key ? key : "");
   uint32_t h2 = ds_net_hash_string(salted);
   mac[0] = 0x02; /* locally administered (bit1), unicast (bit0 clear) */
-  mac[1] = (uint8_t)(h1 >> 24);
-  mac[2] = (uint8_t)(h1 >> 16);
-  mac[3] = (uint8_t)(h1 >> 8);
-  mac[4] = (uint8_t)(h1);
-  mac[5] = (uint8_t)(h2);
-}
-
-/* Derive a stable MAC for a gateway LAN-side veth from its segment key
- * ("{gateway}:{net}").  The gateway's LAN interface (e.g. eth1 inside OpenWrt)
- * then keeps the same MAC every time the cable is (re)plugged - across gateway
- * reboots and self-heal re-wiring - so netifd sees one persistent device
- * instead of re-initialising a new random-MAC device each time. */
-static void ds_segment_mac(const char *key, uint8_t mac[6]) {
-  uint32_t h1 = ds_net_hash_string(key);
-  char salted[400];
-  snprintf(salted, sizeof(salted), "ds-gwmac:%s", key ? key : "");
-  uint32_t h2 = ds_net_hash_string(salted);
-  mac[0] = 0x02; /* locally administered, unicast */
   mac[1] = (uint8_t)(h1 >> 24);
   mac[2] = (uint8_t)(h1 >> 16);
   mac[3] = (uint8_t)(h1 >> 8);
@@ -456,9 +447,7 @@ int ds_net_check_ip_collision(const char *ip_str, const char *exclude_name) {
  * collision.  Deterministic on first boot → same row every time the same
  * container name is used, spreading containers across the /16. */
 static void ds_net_auto_assign_ip(struct ds_config *cfg) {
-  uint32_t hash = 5381;
-  for (const char *p = cfg->container_name; *p; p++)
-    hash = ((hash << 5) + hash) ^ (unsigned char)*p;
+  uint32_t hash = ds_net_hash_string(cfg->container_name);
 
   int o3 = (int)((hash >> 8) % 254) + 1; /* 1-254 */
   int o4 = (int)(hash % 254) + 1;        /* 1-254 */
@@ -1001,7 +990,7 @@ static int gateway_ensure_lan_uplink_locked(struct ds_config *cfg,
     char key[384];
     uint8_t mac[6];
     gateway_hash_key(cfg, key, sizeof(key));
-    ds_segment_mac(key, mac);
+    ds_derive_mac(key, "ds-gwmac:", mac);
     if (ds_nl_set_mac(ctx, gw_peer, mac) < 0)
       ds_warn("[NET] Gateway: failed to pin MAC on %s", gw_peer);
   }
@@ -1104,7 +1093,7 @@ static int gateway_wire_client(struct ds_config *cfg, pid_t client_pid,
    * the move, so the gateway's DHCP leases see one host across reboots. */
   {
     uint8_t mac[6];
-    ds_container_mac(cfg->container_name, mac);
+    ds_derive_mac(cfg->container_name, "ds-mac:", mac);
     if (ds_nl_set_mac(ctx, app_peer, mac) < 0)
       ds_warn("[NET] Gateway: failed to pin MAC on %s", app_peer);
   }
@@ -1289,7 +1278,7 @@ int setup_veth_child_side_named(struct ds_config *cfg, const char *peer_name,
    * churn) instead of a new random MAC each boot. Set while down, pre-up. */
   if (cfg && cfg->container_name[0]) {
     uint8_t mac[6];
-    ds_container_mac(cfg->container_name, mac);
+    ds_derive_mac(cfg->container_name, "ds-mac:", mac);
     if (ds_nl_set_mac(ctx, "eth0", mac) < 0)
       ds_warn("[NET] Child: failed to set deterministic MAC on eth0");
     else
