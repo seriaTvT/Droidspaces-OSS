@@ -369,6 +369,7 @@ struct ds_config {
   int disable_ipv6;        /* --disable-ipv6 */
   int android_storage;     /* --enable-android-storage */
   int selinux_permissive;  /* --selinux-permissive */
+  int userns_allowed;      /* --allow-userns */
   int net_bridgeless;      /* Probe result: no CONFIG_BRIDGE, use PTP NAT */
   int reboot_cycle;        /* 1 if we are in a reboot loop */
   int force_cgroupv1;  /* --force-cgroupv1: use v1 even if v2 is available */
@@ -570,7 +571,7 @@ void android_remount_data_suid(void);
 int android_setup_storage(const char *rootfs_path);
 int android_seccomp_setup(int is_systemd, int block_nested_ns,
                           int privileged_mask);
-int ds_seccomp_apply_minimal(int privileged_mask);
+int ds_seccomp_apply_minimal(int privileged_mask, int userns_allowed);
 
 /* SELinux + Termux privilege helpers */
 int get_selinux_context(const char *path, char *buf, size_t size);

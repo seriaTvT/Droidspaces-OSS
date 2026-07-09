@@ -102,6 +102,7 @@ fun EditContainerScreen(
     var virglExtraFlags by remember { mutableStateOf(container.virglExtraFlags) }
     var enablePulseaudio by remember { mutableStateOf(container.enablePulseaudio) }
     var selinuxPermissive by remember { mutableStateOf(container.selinuxPermissive) }
+    var allowUserns by remember { mutableStateOf(container.allowUserns) }
     var volatileMode by remember { mutableStateOf(container.volatileMode) }
     var bindMounts by remember { mutableStateOf(container.bindMounts) }
     var dnsServers by remember { mutableStateOf(container.dnsServers) }
@@ -147,6 +148,7 @@ fun EditContainerScreen(
     var savedVirglExtraFlags by remember { mutableStateOf(container.virglExtraFlags) }
     var savedEnablePulseaudio by remember { mutableStateOf(container.enablePulseaudio) }
     var savedSelinuxPermissive by remember { mutableStateOf(container.selinuxPermissive) }
+    var savedAllowUserns by remember { mutableStateOf(container.allowUserns) }
     var savedVolatileMode by remember { mutableStateOf(container.volatileMode) }
     var savedBindMounts by remember { mutableStateOf(container.bindMounts) }
     var savedDnsServers by remember { mutableStateOf(container.dnsServers) }
@@ -189,6 +191,7 @@ fun EditContainerScreen(
             virglExtraFlags != savedVirglExtraFlags ||
             enablePulseaudio != savedEnablePulseaudio ||
             selinuxPermissive != savedSelinuxPermissive ||
+            allowUserns != savedAllowUserns ||
             volatileMode != savedVolatileMode ||
             bindMounts != savedBindMounts ||
             dnsServers != savedDnsServers ||
@@ -237,6 +240,7 @@ fun EditContainerScreen(
                     virglExtraFlags = virglExtraFlags,
                     enablePulseaudio = enablePulseaudio,
                     selinuxPermissive = selinuxPermissive,
+                    allowUserns = allowUserns,
                     volatileMode = volatileMode,
                     bindMounts = bindMounts,
                     dnsServers = dnsServers,
@@ -276,6 +280,7 @@ fun EditContainerScreen(
                         savedVirglExtraFlags = virglExtraFlags
                         savedEnablePulseaudio = enablePulseaudio
                         savedSelinuxPermissive = selinuxPermissive
+                        savedAllowUserns = allowUserns
                         savedVolatileMode = volatileMode
                         savedBindMounts = bindMounts
                         savedDnsServers = dnsServers
@@ -962,6 +967,32 @@ fun EditContainerScreen(
                 }
             )
 
+            val isSeccompDisabled = privileged.contains("noseccomp") || privileged.contains("full")
+
+            //use /proc/self/setgroups to detect userns (only exists when CONFIG_USER_NS is enabled)
+            val usernsSupported = remember { java.io.File("/proc/self/setgroups").exists() }
+
+            LaunchedEffect(isSeccompDisabled, usernsSupported) {
+                if (isSeccompDisabled) blockNestedNs = false
+                if (isSeccompDisabled && usernsSupported) allowUserns = true
+                if (!usernsSupported) allowUserns = false
+            }
+
+            ToggleCard(
+                icon = Icons.Default.Groups,
+                title = context.getString(R.string.allow_userns),
+                description = if (usernsSupported)
+                    context.getString(R.string.allow_userns_description)
+                else
+                    context.getString(R.string.allow_userns_description_not_supported),
+                checked = allowUserns,
+                onCheckedChange = {
+                    clearFocus()
+                    allowUserns = it
+                },
+                enabled = !isSeccompDisabled && usernsSupported
+            )
+
             ToggleCard(
                 icon = Icons.Default.AutoDelete,
                 title = context.getString(R.string.volatile_mode),
@@ -983,11 +1014,6 @@ fun EditContainerScreen(
                     forceCgroupv1 = it
                 }
             )
-
-            val isSeccompDisabled = privileged.contains("noseccomp") || privileged.contains("full")
-            LaunchedEffect(isSeccompDisabled) {
-                if (isSeccompDisabled) blockNestedNs = false
-            }
 
             ToggleCard(
                 icon = Icons.Default.GppBad,
