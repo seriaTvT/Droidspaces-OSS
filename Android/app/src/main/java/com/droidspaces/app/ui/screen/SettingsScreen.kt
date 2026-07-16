@@ -568,9 +568,9 @@ private fun AboutDialog(onDismiss: () -> Unit) {
     ) {
         Surface(
             modifier = Modifier
-                .fillMaxWidth(0.9f)
+                .fillMaxWidth()
                 .fillMaxHeight(0.85f)
-                .padding(16.dp),
+                .padding(horizontal = 24.dp),
             shape = RoundedCornerShape(20.dp),
             color = MaterialTheme.colorScheme.surfaceContainer,
             border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
